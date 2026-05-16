@@ -1,7 +1,5 @@
-import 'package:flutter/foundation.dart';
-import 'package:sqflite/sqflite.dart';
-import 'package:sqflite_common_ffi_web/sqflite_ffi_web.dart';
-import 'package:path/path.dart';
+import 'dart:convert';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../models/mood_entry.dart';
 
 class DatabaseService {
@@ -9,111 +7,82 @@ class DatabaseService {
   factory DatabaseService() => _instance;
   DatabaseService._();
 
-  Database? _db;
-  bool _initialized = false;
+  Map<String, MoodEntry> _cache = {};
+  bool _loaded = false;
 
-  Future<Database> get database async {
-    _db ??= await _initDB();
-    return _db!;
+  Future<void> _ensureLoaded() async {
+    if (_loaded) return;
+    final prefs = await SharedPreferences.getInstance();
+    final keys = prefs.getStringList('mood_keys') ?? [];
+    _cache = {};
+    for (final key in keys) {
+      final json = prefs.getString('mood_$key');
+      if (json != null) {
+        final map = jsonDecode(json) as Map<String, dynamic>;
+        _cache[key] = MoodEntry.fromMap(map);
+      }
+    }
+    _loaded = true;
   }
 
-  Future<Database> _initDB() async {
-    if (!_initialized) {
-      if (kIsWeb) {
-        databaseFactory = databaseFactoryFfiWeb;
-      }
-      _initialized = true;
-    }
-    final dbPath = await getDatabasesPath();
-    final path = join(dbPath, 'mood_diary.db');
-    return openDatabase(
-      path,
-      version: 1,
-      onCreate: (db, version) async {
-        await db.execute('''
-          CREATE TABLE mood_entries (
-            id TEXT PRIMARY KEY,
-            date TEXT NOT NULL,
-            mood_value INTEGER NOT NULL,
-            note TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-          )
-        ''');
-        await db.execute(
-          'CREATE UNIQUE INDEX idx_date ON mood_entries(date)',
-        );
-      },
-    );
+  Future<void> _saveKeys(SharedPreferences prefs) async {
+    final keys = _cache.keys.toList()..sort();
+    await prefs.setStringList('mood_keys', keys);
   }
 
   Future<MoodEntry?> getEntry(DateTime date) async {
-    final db = await database;
-    final key = MoodEntry.dateKey(date);
-    final maps = await db.query('mood_entries', where: 'date = ?', whereArgs: [key]);
-    if (maps.isEmpty) return null;
-    return MoodEntry.fromMap(maps.first);
+    await _ensureLoaded();
+    return _cache[MoodEntry.dateKey(date)];
   }
 
   Future<List<MoodEntry>> getEntries(DateTime from, DateTime to) async {
-    final db = await database;
-    final maps = await db.query(
-      'mood_entries',
-      where: 'date >= ? AND date <= ?',
-      whereArgs: [MoodEntry.dateKey(from), MoodEntry.dateKey(to)],
-      orderBy: 'date ASC',
-    );
-    return maps.map((m) => MoodEntry.fromMap(m)).toList();
+    await _ensureLoaded();
+    final fromKey = MoodEntry.dateKey(from);
+    final toKey = MoodEntry.dateKey(to);
+    return _cache.values
+        .where((e) {
+          final k = MoodEntry.dateKey(e.date);
+          return k.compareTo(fromKey) >= 0 && k.compareTo(toKey) <= 0;
+        })
+        .toList()
+      ..sort((a, b) => a.date.compareTo(b.date));
   }
 
   Future<List<MoodEntry>> getAllEntries() async {
-    final db = await database;
-    final maps = await db.query('mood_entries', orderBy: 'date ASC');
-    return maps.map((m) => MoodEntry.fromMap(m)).toList();
+    await _ensureLoaded();
+    final list = _cache.values.toList()
+      ..sort((a, b) => a.date.compareTo(b.date));
+    return list;
   }
 
   Future<MoodEntry> upsertEntry(DateTime date, int moodValue, String? note) async {
-    final db = await database;
+    await _ensureLoaded();
+    final prefs = await SharedPreferences.getInstance();
     final key = MoodEntry.dateKey(date);
-    final now = DateTime.now().toIso8601String();
-    final existing = await getEntry(date);
+    final now = DateTime.now();
+    final existing = _cache[key];
 
-    if (existing != null) {
-      final updated = existing.copyWith(moodValue: moodValue, note: note);
-      await db.update(
-        'mood_entries',
-        {
-          'mood_value': moodValue,
-          'note': note,
-          'updated_at': now,
-        },
-        where: 'date = ?',
-        whereArgs: [key],
-      );
-      return updated;
-    } else {
-      final id = DateTime.now().microsecondsSinceEpoch.toString();
-      await db.insert('mood_entries', {
-        'id': id,
-        'date': key,
-        'mood_value': moodValue,
-        'note': note,
-        'created_at': now,
-        'updated_at': now,
-      });
-      return MoodEntry(
-        id: id,
-        date: DateTime(date.year, date.month, date.day),
-        moodValue: moodValue,
-        note: note,
-        createdAt: DateTime.now(),
-        updatedAt: DateTime.now(),
-      );
-    }
+    final entry = MoodEntry(
+      id: existing?.id ?? now.microsecondsSinceEpoch.toString(),
+      date: DateTime(date.year, date.month, date.day),
+      moodValue: moodValue,
+      note: note,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+    );
+
+    _cache[key] = entry;
+    await prefs.setString('mood_$key', jsonEncode(entry.toMap()));
+    await _saveKeys(prefs);
+    return entry;
   }
 
   Future<void> deleteEntry(DateTime date) async {
-    final db = await database;
-    await db.delete('mood_entries', where: 'date = ?', whereArgs: [MoodEntry.dateKey(date)]);
+    await _ensureLoaded();
+    final prefs = await SharedPreferences.getInstance();
+    final key = MoodEntry.dateKey(date);
+    _cache.remove(key);
+    await prefs.remove('mood_$key');
+    await _saveKeys(prefs);
   }
 }
