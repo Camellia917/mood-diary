@@ -1,0 +1,10 @@
+build/
+.dart_tool/
+.idea/
+*.iml
+.gradle/
+local.properties
+*.lock
+*.pyc
+.DS_Store
+*.log
